@@ -1,11 +1,26 @@
-CC=gcc
-CFLAGS=-O2 -Wall -Wextra -std=c11
-LDLIBS=-lncursesw
+# ShellBeats Makefile
+CC = gcc
+CFLAGS = -Wall -Wextra -O2
+LDFLAGS = -lncurses
 
-all: shellbeats
+TARGET = shellbeats
+SRC = shellbeats.c
 
-shellbeats: shellbeats.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+.PHONY: all clean install uninstall
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+debug: $(SRC)
+	$(CC) $(CFLAGS) -g -DDEBUG -o $(TARGET) $< $(LDFLAGS)
 
 clean:
-	rm -f shellbeats
+	rm -f $(TARGET)
+
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/bin/
+
+uninstall:
+	rm -f /usr/local/bin/$(TARGET)
