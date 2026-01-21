@@ -1,3 +1,8 @@
+## Official website
+https://shellbeats.com
+
+[![Make a donation](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=RFY5QFC6XDX5N)
+
 ## Updates
 
 **v0.3** - Playlist support and download features!
