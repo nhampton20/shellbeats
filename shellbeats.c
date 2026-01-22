@@ -1697,7 +1697,7 @@ static void format_duration(int sec, char out[16]) {
 static void draw_header(int cols, ViewMode view) {
     // Line 1: Title
     attron(A_BOLD);
-    mvprintw(0, 0, " ShellBeats v0.3 ");
+    mvprintw(0, 0, " ShellBeats v0.4 ");
     attroff(A_BOLD);
 
     // Line 2-3: Shortcuts (two lines)
@@ -2230,7 +2230,7 @@ static void draw_about_view(AppState *st, const char *status, int rows, int cols
 
     // Title
     attron(A_BOLD | A_REVERSE);
-    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.3");
+    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.4");
     attroff(A_BOLD | A_REVERSE);
 
     // Version and description
@@ -2358,7 +2358,7 @@ static void show_help(void) {
     
     int y = 2;
     attron(A_BOLD);
-    mvprintw(y++, 2, "ShellBeats v0.3 | Help");
+    mvprintw(y++, 2, "ShellBeats v0.4 | Help");
     attroff(A_BOLD);
     y++;
     
