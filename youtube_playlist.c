@@ -5,9 +5,12 @@
 
 int fetch_youtube_playlist(const char *url, Song *songs, int max_songs,
                            char *playlist_title, size_t title_size,
-                           progress_callback_t progress_callback, void *callback_data) {
-    if (!url || !songs || max_songs <= 0 || !playlist_title || title_size == 0) 
+                           progress_callback_t progress_callback, void *callback_data,
+                           const char *ytdlp_cmd) {
+    if (!url || !songs || max_songs <= 0 || !playlist_title || title_size == 0)
         return -1;
+
+    if (!ytdlp_cmd || !ytdlp_cmd[0]) ytdlp_cmd = "yt-dlp";
 
     // Report: Fetching playlist title
     if (progress_callback) {
@@ -16,8 +19,8 @@ int fetch_youtube_playlist(const char *url, Song *songs, int max_songs,
 
     char title_cmd[2048];
     snprintf(title_cmd, sizeof(title_cmd),
-             "yt-dlp --flat-playlist --quiet --no-warnings "
-             "--print '%%(playlist_title)s' '%s' 2>/dev/null", url);
+             "%s --flat-playlist --quiet --no-warnings "
+             "--print '%%(playlist_title)s' '%s' 2>/dev/null", ytdlp_cmd, url);
 
     FILE *title_fp = popen(title_cmd, "r");
     if (!title_fp) return -1;
@@ -45,9 +48,9 @@ int fetch_youtube_playlist(const char *url, Song *songs, int max_songs,
 
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "yt-dlp --flat-playlist --quiet --no-warnings "
+             "%s --flat-playlist --quiet --no-warnings "
              "--print '%%(title)s|||%%(id)s|||%%(duration)s' "
-             "'%s' 2>/dev/null", url);
+             "'%s' 2>/dev/null", ytdlp_cmd, url);
 
     FILE *fp = popen(cmd, "r");
     if (!fp) return -1;

@@ -11,6 +11,7 @@
 #include <poll.h>
 #include <pthread.h>  // NEW: for download thread
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,9 @@
 #define CONFIG_FILE "config.json"  // NEW: config file name
 #define DOWNLOAD_QUEUE_FILE "download_queue.json"  // NEW: download queue file
 #define MAX_DOWNLOAD_QUEUE 1000  // NEW: max download queue size
+#define YTDLP_BIN_DIR "bin"
+#define YTDLP_BINARY "yt-dlp"
+#define YTDLP_VERSION_FILE "yt-dlp.version"
 
 // ============================================================================
 // Data Structures
@@ -142,13 +146,26 @@ typedef struct {
     char playlists_index[16384]; // Significantly increased buffer size
     char config_file[16384];     // Significantly increased buffer size
     char download_queue_file[16384]; // Significantly increased buffer size
-    
+
+    // yt-dlp auto-update paths
+    char ytdlp_bin_dir[1024];
+    char ytdlp_local_path[1024];
+    char ytdlp_version_file[1024];
+
     // NEW: Configuration
     Config config;
-    
+
     // NEW: Download queue
     DownloadQueue download_queue;
-    
+
+    // yt-dlp auto-update state
+    bool ytdlp_updating;
+    bool ytdlp_update_done;
+    bool ytdlp_has_local;
+    pthread_t ytdlp_update_thread;
+    bool ytdlp_update_thread_running;
+    char ytdlp_update_status[128];
+
     // NEW: Spinner state for download progress
     int spinner_frame;
     time_t last_spinner_update;
@@ -164,6 +181,24 @@ static volatile sig_atomic_t got_sigchld = 0;
 
 // NEW: Global pointer for download thread access
 static AppState *g_app_state = NULL;
+
+// Logging system (activated with -log flag)
+static FILE *g_log_file = NULL;
+
+static void sb_log(const char *fmt, ...) {
+    if (!g_log_file) return;
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    fprintf(g_log_file, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+            tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+            tm->tm_hour, tm->tm_min, tm->tm_sec);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_log_file, fmt, ap);
+    va_end(ap);
+    fprintf(g_log_file, "\n");
+    fflush(g_log_file);
+}
 
 // ============================================================================
 // Forward Declarations
@@ -467,25 +502,35 @@ static bool init_config_dirs(AppState *st) {
     snprintf(st->playlists_index, sizeof(st->playlists_index), "%s/%s", st->config_dir, PLAYLISTS_INDEX);
     snprintf(st->config_file, sizeof(st->config_file), "%s/%s", st->config_dir, CONFIG_FILE);  // NEW
     snprintf(st->download_queue_file, sizeof(st->download_queue_file), "%s/%s", st->config_dir, DOWNLOAD_QUEUE_FILE);  // NEW
-    
+
+    // yt-dlp auto-update paths
+    snprintf(st->ytdlp_bin_dir, sizeof(st->ytdlp_bin_dir), "%s/%s", st->config_dir, YTDLP_BIN_DIR);
+    snprintf(st->ytdlp_local_path, sizeof(st->ytdlp_local_path), "%s/%s", st->ytdlp_bin_dir, YTDLP_BINARY);
+    snprintf(st->ytdlp_version_file, sizeof(st->ytdlp_version_file), "%s/%s", st->config_dir, YTDLP_VERSION_FILE);
+
     st->config_dir[sizeof(st->config_dir) - 1] = '\0';
     st->playlists_dir[sizeof(st->playlists_dir) - 1] = '\0';
     st->playlists_index[sizeof(st->playlists_index) - 1] = '\0';
     st->config_file[sizeof(st->config_file) - 1] = '\0';  // NEW
     st->download_queue_file[sizeof(st->download_queue_file) - 1] = '\0';  // NEW
-    
+
     // Create config directory if not exists
     if (!dir_exists(st->config_dir)) {
         if (mkdir(st->config_dir, 0755) != 0) {
             return false;
         }
     }
-    
+
     // Create playlists directory if not exists
     if (!dir_exists(st->playlists_dir)) {
         if (mkdir(st->playlists_dir, 0755) != 0) {
             return false;
         }
+    }
+
+    // Create bin directory for local yt-dlp (non-fatal: auto-update is optional)
+    if (!dir_exists(st->ytdlp_bin_dir)) {
+        mkdir(st->ytdlp_bin_dir, 0755);  // best-effort, app works without it
     }
     
     // Create empty playlists index if not exists
@@ -498,6 +543,210 @@ static bool init_config_dirs(AppState *st) {
     }
     
     return true;
+}
+
+// ============================================================================
+// yt-dlp Auto-Update System
+// ============================================================================
+
+// Returns the path to the yt-dlp binary to use.
+// Prefers local copy in ~/.shellbeats/bin/yt-dlp, falls back to system yt-dlp.
+static const char *get_ytdlp_cmd(AppState *st) {
+    if (st->ytdlp_has_local && file_exists(st->ytdlp_local_path)) {
+        return st->ytdlp_local_path;
+    }
+    return "yt-dlp";
+}
+
+static void *ytdlp_update_thread_func(void *arg) {
+    AppState *st = (AppState *)arg;
+
+    sb_log("yt-dlp update thread started");
+    sb_log("  local_path: %s", st->ytdlp_local_path);
+    sb_log("  version_file: %s", st->ytdlp_version_file);
+    sb_log("  bin_dir: %s", st->ytdlp_bin_dir);
+    sb_log("  bin_dir exists: %s", dir_exists(st->ytdlp_bin_dir) ? "yes" : "no");
+
+    snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+             "Checking for yt-dlp updates...");
+
+    // Detect available download tool (curl or wget)
+    bool has_curl = (system("command -v curl >/dev/null 2>&1") == 0);
+    bool has_wget = (system("command -v wget >/dev/null 2>&1") == 0);
+    sb_log("  has_curl: %s, has_wget: %s", has_curl ? "yes" : "no", has_wget ? "yes" : "no");
+
+    if (!has_curl && !has_wget) {
+        sb_log("  ABORT: no curl or wget found");
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "No curl or wget found");
+        st->ytdlp_updating = false;
+        st->ytdlp_update_done = true;
+        return NULL;
+    }
+
+    // Get latest version tag by following the GitHub redirect
+    char version_cmd[512];
+    if (has_curl) {
+        snprintf(version_cmd, sizeof(version_cmd),
+                 "curl -sL -o /dev/null -w '%%{url_effective}' "
+                 "'https://github.com/yt-dlp/yt-dlp/releases/latest' 2>/dev/null");
+    } else {
+        snprintf(version_cmd, sizeof(version_cmd),
+                 "wget --spider -S --max-redirect=5 "
+                 "'https://github.com/yt-dlp/yt-dlp/releases/latest' 2>&1 "
+                 "| grep -i 'Location:' | tail -1 | awk '{print $2}'");
+    }
+    sb_log("  version_cmd: %s", version_cmd);
+
+    FILE *fp = popen(version_cmd, "r");
+    if (!fp) {
+        sb_log("  ABORT: popen failed for version check");
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "Update check failed");
+        st->ytdlp_updating = false;
+        st->ytdlp_update_done = true;
+        return NULL;
+    }
+
+    char redirect_url[512] = {0};
+    if (!fgets(redirect_url, sizeof(redirect_url), fp)) {
+        redirect_url[0] = '\0';
+    }
+    int pclose_ret = pclose(fp);
+    sb_log("  redirect_url: '%s' (pclose=%d)", redirect_url, pclose_ret);
+
+    // Extract version tag from URL (e.g., .../tag/2025.01.26)
+    char *tag = strrchr(redirect_url, '/');
+    if (!tag || strlen(tag) < 2) {
+        sb_log("  ABORT: could not extract tag from redirect_url");
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "No network or failed to check version");
+        st->ytdlp_updating = false;
+        st->ytdlp_update_done = true;
+        return NULL;
+    }
+    tag++;
+
+    // Trim whitespace/newlines
+    size_t tag_len = strlen(tag);
+    while (tag_len > 0 && (tag[tag_len - 1] == '\n' || tag[tag_len - 1] == '\r' ||
+           tag[tag_len - 1] == ' ')) {
+        tag[--tag_len] = '\0';
+    }
+    sb_log("  parsed tag: '%s'", tag);
+
+    if (tag_len == 0) {
+        sb_log("  ABORT: empty tag after trimming");
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "Could not parse yt-dlp version");
+        st->ytdlp_updating = false;
+        st->ytdlp_update_done = true;
+        return NULL;
+    }
+
+    // Check local version — skip download if already up to date
+    bool needs_download = true;
+    sb_log("  checking local version file: %s (exists=%s)",
+           st->ytdlp_version_file, file_exists(st->ytdlp_version_file) ? "yes" : "no");
+    sb_log("  checking local binary: %s (exists=%s)",
+           st->ytdlp_local_path, file_exists(st->ytdlp_local_path) ? "yes" : "no");
+
+    if (file_exists(st->ytdlp_version_file) && file_exists(st->ytdlp_local_path)) {
+        FILE *vf = fopen(st->ytdlp_version_file, "r");
+        if (vf) {
+            char local_ver[128] = {0};
+            if (fgets(local_ver, sizeof(local_ver), vf)) {
+                size_t lv_len = strlen(local_ver);
+                while (lv_len > 0 && (local_ver[lv_len - 1] == '\n' ||
+                       local_ver[lv_len - 1] == '\r')) {
+                    local_ver[--lv_len] = '\0';
+                }
+                sb_log("  local_ver: '%s' vs remote: '%s'", local_ver, tag);
+                if (strcmp(local_ver, tag) == 0) {
+                    needs_download = false;
+                }
+            }
+            fclose(vf);
+        }
+    }
+
+    if (!needs_download) {
+        sb_log("  already up to date, skipping download");
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "yt-dlp is up to date (%s)", tag);
+        st->ytdlp_has_local = true;
+        st->ytdlp_updating = false;
+        st->ytdlp_update_done = true;
+        return NULL;
+    }
+
+    // Download latest yt-dlp binary
+    sb_log("  needs download, starting...");
+    snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+             "Downloading yt-dlp %s...", tag);
+
+    char dl_cmd[2048];
+    if (has_curl) {
+        snprintf(dl_cmd, sizeof(dl_cmd),
+                 "curl -sL 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp' "
+                 "-o '%s' 2>/dev/null && chmod +x '%s'",
+                 st->ytdlp_local_path, st->ytdlp_local_path);
+    } else {
+        snprintf(dl_cmd, sizeof(dl_cmd),
+                 "wget -q 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp' "
+                 "-O '%s' 2>/dev/null && chmod +x '%s'",
+                 st->ytdlp_local_path, st->ytdlp_local_path);
+    }
+    sb_log("  dl_cmd: %s", dl_cmd);
+
+    int result = system(dl_cmd);
+    sb_log("  download result: %d", result);
+    sb_log("  file exists after download: %s", file_exists(st->ytdlp_local_path) ? "yes" : "no");
+
+    if (result == 0 && file_exists(st->ytdlp_local_path)) {
+        FILE *vf = fopen(st->ytdlp_version_file, "w");
+        if (vf) {
+            fprintf(vf, "%s\n", tag);
+            fclose(vf);
+            sb_log("  version file written: %s", tag);
+        } else {
+            sb_log("  WARN: could not write version file");
+        }
+        st->ytdlp_has_local = true;
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "yt-dlp updated to %s", tag);
+        sb_log("  SUCCESS: yt-dlp updated to %s", tag);
+    } else {
+        snprintf(st->ytdlp_update_status, sizeof(st->ytdlp_update_status),
+                 "yt-dlp download failed");
+        sb_log("  FAILED: download failed (result=%d)", result);
+    }
+
+    st->ytdlp_updating = false;
+    st->ytdlp_update_done = true;
+    sb_log("yt-dlp update thread finished");
+    return NULL;
+}
+
+static void start_ytdlp_update(AppState *st) {
+    if (st->ytdlp_update_thread_running) return;
+
+    st->ytdlp_has_local = file_exists(st->ytdlp_local_path);
+    st->ytdlp_updating = true;
+    st->ytdlp_update_done = false;
+
+    if (pthread_create(&st->ytdlp_update_thread, NULL,
+                       ytdlp_update_thread_func, st) == 0) {
+        st->ytdlp_update_thread_running = true;
+    } else {
+        st->ytdlp_updating = false;
+    }
+}
+
+static void stop_ytdlp_update(AppState *st) {
+    if (!st->ytdlp_update_thread_running) return;
+    pthread_join(st->ytdlp_update_thread, NULL);
+    st->ytdlp_update_thread_running = false;
 }
 
 // ============================================================================
@@ -768,12 +1017,12 @@ static void *download_thread_func(void *arg) {
             continue;
         }
         
-        // Build yt-dlp command
+        // Build yt-dlp command (uses local binary if available)
         char cmd[4096];
         snprintf(cmd, sizeof(cmd),
-                 "yt-dlp -x --audio-format mp3 --no-playlist --quiet --no-warnings "
+                 "%s -x --audio-format mp3 --no-playlist --quiet --no-warnings "
                  "-o '%s' 'https://www.youtube.com/watch?v=%s' >/dev/null 2>&1",
-                 dest_path, task.video_id);
+                 get_ytdlp_cmd(st), dest_path, task.video_id);
         
         // Execute download
         int result = system(cmd);
@@ -1315,81 +1564,116 @@ static bool remove_song_from_playlist(AppState *st, int playlist_idx, int song_i
 
 static void mpv_disconnect(void) {
     if (mpv_ipc_fd >= 0) {
+        sb_log("[PLAYBACK] mpv_disconnect: closing IPC fd=%d", mpv_ipc_fd);
         close(mpv_ipc_fd);
         mpv_ipc_fd = -1;
     }
 }
 
 static bool mpv_connect(void) {
-    if (mpv_ipc_fd >= 0) return true;
-    if (!file_exists(IPC_SOCKET)) return false;
-    
+    if (mpv_ipc_fd >= 0) {
+        sb_log("[PLAYBACK] mpv_connect: already connected (fd=%d)", mpv_ipc_fd);
+        return true;
+    }
+    if (!file_exists(IPC_SOCKET)) {
+        sb_log("[PLAYBACK] mpv_connect: IPC socket %s does not exist", IPC_SOCKET);
+        return false;
+    }
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    
+    if (fd < 0) {
+        sb_log("[PLAYBACK] mpv_connect: socket() failed: %s (errno=%d)", strerror(errno), errno);
+        return false;
+    }
+
     // Set non-blocking
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    
+
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, IPC_SOCKET, sizeof(addr.sun_path) - 1);
-    
+
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        sb_log("[PLAYBACK] mpv_connect: connect() to %s failed: %s (errno=%d)", IPC_SOCKET, strerror(errno), errno);
         close(fd);
         return false;
     }
-    
+
     mpv_ipc_fd = fd;
-    
+    sb_log("[PLAYBACK] mpv_connect: connected to mpv IPC socket (fd=%d)", fd);
+
     // Enable end-file event observation
     const char *observe_cmd = "{\"command\":[\"observe_property\",1,\"eof-reached\"]}\n";
     ssize_t w = write(mpv_ipc_fd, observe_cmd, strlen(observe_cmd));
+    if (w < 0) {
+        sb_log("[PLAYBACK] mpv_connect: failed to send observe command: %s", strerror(errno));
+    }
     (void)w;
-    
+
     return true;
 }
 
 static void mpv_send_command(const char *cmd) {
+    sb_log("[PLAYBACK] mpv_send_command: sending: %s", cmd);
     if (!mpv_connect()) {
+        sb_log("[PLAYBACK] mpv_send_command: persistent connection failed, trying one-shot");
         // Try one-shot connection
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) return;
-        
+        if (fd < 0) {
+            sb_log("[PLAYBACK] mpv_send_command: one-shot socket() failed: %s", strerror(errno));
+            return;
+        }
+
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
         strncpy(addr.sun_path, IPC_SOCKET, sizeof(addr.sun_path) - 1);
-        
+
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
             ssize_t w = write(fd, cmd, strlen(cmd));
             w = write(fd, "\n", 1);
+            sb_log("[PLAYBACK] mpv_send_command: one-shot command sent (bytes=%zd)", w);
             (void)w;
+        } else {
+            sb_log("[PLAYBACK] mpv_send_command: one-shot connect() failed: %s", strerror(errno));
         }
         close(fd);
         return;
     }
-    
+
     ssize_t w = write(mpv_ipc_fd, cmd, strlen(cmd));
+    if (w < 0) {
+        sb_log("[PLAYBACK] mpv_send_command: write failed: %s (errno=%d)", strerror(errno), errno);
+    } else {
+        sb_log("[PLAYBACK] mpv_send_command: sent %zd bytes on fd=%d", w, mpv_ipc_fd);
+    }
     w = write(mpv_ipc_fd, "\n", 1);
     (void)w;
 }
 
 static void mpv_toggle_pause(void) {
+    sb_log("[PLAYBACK] mpv_toggle_pause called");
     mpv_send_command("{\"command\":[\"cycle\",\"pause\"]}");
 }
 
 static void mpv_stop_playback(void) {
+    sb_log("[PLAYBACK] mpv_stop_playback called");
     mpv_send_command("{\"command\":[\"stop\"]}");
 }
 
 static void mpv_load_url(const char *url) {
+    sb_log("[PLAYBACK] mpv_load_url: loading URL: %s", url);
+
     char *escaped = NULL;
     size_t n = 0;
     FILE *mem = open_memstream(&escaped, &n);
-    if (!mem) return;
-    
+    if (!mem) {
+        sb_log("[PLAYBACK] mpv_load_url: open_memstream failed: %s", strerror(errno));
+        return;
+    }
+
     fputc('"', mem);
     for (const char *p = url; *p; p++) {
         if (*p == '"' || *p == '\\') fputc('\\', mem);
@@ -1397,21 +1681,33 @@ static void mpv_load_url(const char *url) {
     }
     fputc('"', mem);
     fclose(mem);
-    
+
     char cmd[4096];
     snprintf(cmd, sizeof(cmd),
              "{\"command\":[\"loadfile\",%s,\"replace\"]}", escaped);
     free(escaped);
-    
+
+    sb_log("[PLAYBACK] mpv_load_url: sending loadfile command to mpv");
     mpv_send_command(cmd);
 }
 
-static void mpv_start_if_needed(void) {
-    if (file_exists(IPC_SOCKET) && mpv_connect()) return;
-    
+static void mpv_start_if_needed(AppState *st) {
+    sb_log("[PLAYBACK] mpv_start_if_needed: checking if mpv is running...");
+    if (file_exists(IPC_SOCKET) && mpv_connect()) {
+        sb_log("[PLAYBACK] mpv_start_if_needed: mpv already running and connected");
+        return;
+    }
+
+    sb_log("[PLAYBACK] mpv_start_if_needed: mpv not running, starting new instance...");
     unlink(IPC_SOCKET);
     mpv_disconnect();
-    
+
+    // Build ytdl_hook path option so mpv can find yt-dlp
+    const char *ytdlp_path = get_ytdlp_cmd(st);
+    char ytdl_opt[1200];
+    snprintf(ytdl_opt, sizeof(ytdl_opt), "--script-opts=ytdl_hook-ytdl_path=%s", ytdlp_path);
+    sb_log("[PLAYBACK] mpv_start_if_needed: yt-dlp path for mpv: %s", ytdlp_path);
+
     pid_t pid = fork();
     if (pid == 0) {
         int fd = open("/dev/null", O_WRONLY);
@@ -1426,61 +1722,87 @@ static void mpv_start_if_needed(void) {
                "--force-window=no",
                "--really-quiet",
                "--input-ipc-server=" IPC_SOCKET,
+               ytdl_opt,
                (char *)NULL);
         _exit(127);
     }
-    
-    if (pid > 0) {
-        mpv_pid = pid;
-        for (int i = 0; i < 100; i++) {
-            if (file_exists(IPC_SOCKET)) {
-                usleep(50 * 1000);
-                mpv_connect();
-                break;
-            }
+
+    if (pid < 0) {
+        sb_log("[PLAYBACK] mpv_start_if_needed: fork() failed: %s (errno=%d)", strerror(errno), errno);
+        return;
+    }
+
+    sb_log("[PLAYBACK] mpv_start_if_needed: mpv forked with pid=%d, waiting for IPC socket...", pid);
+    mpv_pid = pid;
+    bool connected = false;
+    for (int i = 0; i < 100; i++) {
+        if (file_exists(IPC_SOCKET)) {
+            sb_log("[PLAYBACK] mpv_start_if_needed: IPC socket appeared after %d ms", (i + 1) * 50);
             usleep(50 * 1000);
+            if (mpv_connect()) {
+                sb_log("[PLAYBACK] mpv_start_if_needed: successfully connected to mpv (pid=%d)", pid);
+                connected = true;
+            } else {
+                sb_log("[PLAYBACK] mpv_start_if_needed: IPC socket exists but connect failed");
+            }
+            break;
         }
+        usleep(50 * 1000);
+    }
+    if (!connected) {
+        sb_log("[PLAYBACK] mpv_start_if_needed: WARNING - failed to connect after 5s timeout (pid=%d)", pid);
     }
 }
 
 static void mpv_quit(void) {
+    sb_log("[PLAYBACK] mpv_quit: shutting down mpv (pid=%d)", mpv_pid);
     mpv_send_command("{\"command\":[\"quit\"]}");
     usleep(100 * 1000);
-    
+
     mpv_disconnect();
-    
+
     if (mpv_pid > 0) {
         kill(mpv_pid, SIGTERM);
         waitpid(mpv_pid, NULL, WNOHANG);
+        sb_log("[PLAYBACK] mpv_quit: sent SIGTERM to pid=%d", mpv_pid);
         mpv_pid = -1;
     }
     unlink(IPC_SOCKET);
+    sb_log("[PLAYBACK] mpv_quit: cleanup complete");
 }
 
 // Check if mpv finished playing (returns true if track ended)
 // Only returns true for genuine end-of-file, not loading states
 static bool mpv_check_track_end(void) {
     if (mpv_ipc_fd < 0) return false;
-    
+
     char buf[4096];
     ssize_t n = read(mpv_ipc_fd, buf, sizeof(buf) - 1);
-    
+
     if (n <= 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             // Connection lost
+            sb_log("[PLAYBACK] mpv_check_track_end: connection lost: %s (errno=%d)", strerror(errno), errno);
             mpv_disconnect();
         }
         return false;
     }
-    
+
     buf[n] = '\0';
-    
+    sb_log("[PLAYBACK] mpv_check_track_end: IPC data received (%zd bytes): %.200s", n, buf);
+
     // Only trigger on end-file event with reason "eof" (not "error" or "stop")
     // Format: {"event":"end-file","reason":"eof",...}
     if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"eof\"")) {
+        sb_log("[PLAYBACK] mpv_check_track_end: track ended (EOF)");
         return true;
     }
-    
+
+    // Log if there's an end-file with error reason (useful for debugging stream failures)
+    if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"error\"")) {
+        sb_log("[PLAYBACK] mpv_check_track_end: WARNING - track ended with ERROR");
+    }
+
     return false;
 }
 
@@ -1504,14 +1826,16 @@ static void free_search_results(AppState *st) {
 
 static int run_search(AppState *st, const char *raw_query) {
     free_search_results(st);
-    
+
     char query_buf[256];
     strncpy(query_buf, raw_query, sizeof(query_buf) - 1);
     query_buf[sizeof(query_buf) - 1] = '\0';
     char *query = trim_whitespace(query_buf);
-    
+
     if (!query[0]) return 0;
-    
+
+    sb_log("[PLAYBACK] run_search: query=\"%s\"", query);
+
     // Escape for shell
     char escaped_query[512];
     size_t j = 0;
@@ -1523,16 +1847,21 @@ static int run_search(AppState *st, const char *raw_query) {
         escaped_query[j++] = c;
     }
     escaped_query[j] = '\0';
-    
+
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-             "yt-dlp --flat-playlist --quiet --no-warnings "
+             "%s --flat-playlist --quiet --no-warnings "
              "--print '%%(title)s|||%%(id)s' "
              "\"ytsearch%d:%s\" 2>/dev/null",
-             MAX_RESULTS, escaped_query);
-    
+             get_ytdlp_cmd(st), MAX_RESULTS, escaped_query);
+
+    sb_log("[PLAYBACK] run_search: executing: %s", cmd);
+
     FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
+    if (!fp) {
+        sb_log("[PLAYBACK] run_search: popen() failed: %s", strerror(errno));
+        return -1;
+    }
     
     char *line = NULL;
     size_t cap = 0;
@@ -1587,7 +1916,9 @@ static int run_search(AppState *st, const char *raw_query) {
     st->search_scroll = 0;
     strncpy(st->query, query, sizeof(st->query) - 1);
     st->query[sizeof(st->query) - 1] = '\0';
-    
+
+    sb_log("[PLAYBACK] run_search: found %d results for query=\"%s\"", count, query);
+
     return count;
 }
 
@@ -1596,30 +1927,60 @@ static int run_search(AppState *st, const char *raw_query) {
 // ============================================================================
 
 static void play_search_result(AppState *st, int idx) {
-    if (idx < 0 || idx >= st->search_count) return;
-    if (!st->search_results[idx].url) return;
-    
-    mpv_start_if_needed();
+    if (idx < 0 || idx >= st->search_count) {
+        sb_log("[PLAYBACK] play_search_result: invalid index %d (count=%d)", idx, st->search_count);
+        return;
+    }
+    if (!st->search_results[idx].url) {
+        sb_log("[PLAYBACK] play_search_result: no URL for result %d", idx);
+        return;
+    }
+
+    sb_log("[PLAYBACK] play_search_result: playing result #%d: \"%s\" url=%s",
+           idx, st->search_results[idx].title ? st->search_results[idx].title : "(null)",
+           st->search_results[idx].url);
+
+    mpv_start_if_needed(st);
     mpv_load_url(st->search_results[idx].url);
-    
+
     st->playing_index = idx;
     st->playing_from_playlist = false;
     st->playing_playlist_idx = -1;
     st->paused = false;
     st->playback_started = time(NULL);
+    sb_log("[PLAYBACK] play_search_result: playback started for result #%d", idx);
 }
 
 static void play_playlist_song(AppState *st, int playlist_idx, int song_idx) {
-    if (playlist_idx < 0 || playlist_idx >= st->playlist_count) return;
+    if (playlist_idx < 0 || playlist_idx >= st->playlist_count) {
+        sb_log("[PLAYBACK] play_playlist_song: invalid playlist_idx=%d (count=%d)", playlist_idx, st->playlist_count);
+        return;
+    }
 
     Playlist *pl = &st->playlists[playlist_idx];
-    if (song_idx < 0 || song_idx >= pl->count) return;
-    if (!pl->items[song_idx].url) return;
+    if (song_idx < 0 || song_idx >= pl->count) {
+        sb_log("[PLAYBACK] play_playlist_song: invalid song_idx=%d (count=%d) in playlist \"%s\"",
+               song_idx, pl->count, pl->name ? pl->name : "(null)");
+        return;
+    }
+    if (!pl->items[song_idx].url) {
+        sb_log("[PLAYBACK] play_playlist_song: no URL for song %d in playlist \"%s\"",
+               song_idx, pl->name ? pl->name : "(null)");
+        return;
+    }
 
-    mpv_start_if_needed();
+    sb_log("[PLAYBACK] play_playlist_song: playlist=\"%s\" song=#%d \"%s\" video_id=%s url=%s is_youtube=%d",
+           pl->name ? pl->name : "(null)", song_idx,
+           pl->items[song_idx].title ? pl->items[song_idx].title : "(null)",
+           pl->items[song_idx].video_id ? pl->items[song_idx].video_id : "(null)",
+           pl->items[song_idx].url,
+           pl->is_youtube_playlist);
+
+    mpv_start_if_needed(st);
 
     // Check if YouTube playlist - always stream
     if (pl->is_youtube_playlist) {
+        sb_log("[PLAYBACK] play_playlist_song: streaming YouTube playlist song: %s", pl->items[song_idx].url);
         mpv_load_url(pl->items[song_idx].url);
     } else {
         // Check if local file exists for this song
@@ -1627,9 +1988,11 @@ static void play_playlist_song(AppState *st, int playlist_idx, int song_idx) {
         if (get_local_file_path_for_song(st, pl->name, pl->items[song_idx].video_id,
                                           local_path, sizeof(local_path))) {
             // Play from local file
+            sb_log("[PLAYBACK] play_playlist_song: playing LOCAL file: %s", local_path);
             mpv_load_url(local_path);
         } else {
             // Stream from YouTube
+            sb_log("[PLAYBACK] play_playlist_song: no local file, STREAMING from: %s", pl->items[song_idx].url);
             mpv_load_url(pl->items[song_idx].url);
         }
     }
@@ -1639,37 +2002,54 @@ static void play_playlist_song(AppState *st, int playlist_idx, int song_idx) {
     st->playing_playlist_idx = playlist_idx;
     st->paused = false;
     st->playback_started = time(NULL);
+    sb_log("[PLAYBACK] play_playlist_song: playback started");
 }
 
 static void play_next(AppState *st) {
+    sb_log("[PLAYBACK] play_next: current index=%d, from_playlist=%d, playlist_idx=%d",
+           st->playing_index, st->playing_from_playlist, st->playing_playlist_idx);
     if (st->playing_from_playlist && st->playing_playlist_idx >= 0) {
         Playlist *pl = &st->playlists[st->playing_playlist_idx];
         int next = st->playing_index + 1;
         if (next < pl->count) {
+            sb_log("[PLAYBACK] play_next: advancing to playlist song #%d/%d", next, pl->count);
             play_playlist_song(st, st->playing_playlist_idx, next);
             st->playlist_song_selected = next;
+        } else {
+            sb_log("[PLAYBACK] play_next: already at last song in playlist (%d/%d)", st->playing_index, pl->count);
         }
     } else if (st->search_count > 0) {
         int next = st->playing_index + 1;
         if (next < st->search_count) {
+            sb_log("[PLAYBACK] play_next: advancing to search result #%d/%d", next, st->search_count);
             play_search_result(st, next);
             st->search_selected = next;
+        } else {
+            sb_log("[PLAYBACK] play_next: already at last search result (%d/%d)", st->playing_index, st->search_count);
         }
     }
 }
 
 static void play_prev(AppState *st) {
+    sb_log("[PLAYBACK] play_prev: current index=%d, from_playlist=%d, playlist_idx=%d",
+           st->playing_index, st->playing_from_playlist, st->playing_playlist_idx);
     if (st->playing_from_playlist && st->playing_playlist_idx >= 0) {
         int prev = st->playing_index - 1;
         if (prev >= 0) {
+            sb_log("[PLAYBACK] play_prev: going back to playlist song #%d", prev);
             play_playlist_song(st, st->playing_playlist_idx, prev);
             st->playlist_song_selected = prev;
+        } else {
+            sb_log("[PLAYBACK] play_prev: already at first song in playlist");
         }
     } else if (st->search_count > 0) {
         int prev = st->playing_index - 1;
         if (prev >= 0) {
+            sb_log("[PLAYBACK] play_prev: going back to search result #%d", prev);
             play_search_result(st, prev);
             st->search_selected = prev;
+        } else {
+            sb_log("[PLAYBACK] play_prev: already at first search result");
         }
     }
 }
@@ -1697,7 +2077,7 @@ static void format_duration(int sec, char out[16]) {
 static void draw_header(int cols, ViewMode view) {
     // Line 1: Title
     attron(A_BOLD);
-    mvprintw(0, 0, " ShellBeats v0.4 ");
+    mvprintw(0, 0, " ShellBeats v0.5 ");
     attroff(A_BOLD);
 
     // Line 2-3: Shortcuts (two lines)
@@ -1739,36 +2119,54 @@ static char get_spinner_char(int frame) {
 
 // NEW: Draw download status in status bar area
 static void draw_download_status(AppState *st, int rows, int cols) {
+    char dl_status[128] = {0};
+    char spinner = get_spinner_char(st->spinner_frame);
+    int status_parts = 0;
+
+    // yt-dlp update status (shown while updating)
+    if (st->ytdlp_updating) {
+        snprintf(dl_status, sizeof(dl_status), "[%c Fetching updates...]", spinner);
+        status_parts++;
+    }
+
+    // Download queue status
     pthread_mutex_lock(&st->download_queue.mutex);
-    
+
     int pending_count = 0;
     int completed = st->download_queue.completed;
     int failed = st->download_queue.failed;
-    
+
     for (int i = 0; i < st->download_queue.count; i++) {
         if (st->download_queue.tasks[i].status == DOWNLOAD_PENDING ||
             st->download_queue.tasks[i].status == DOWNLOAD_ACTIVE) {
             pending_count++;
         }
     }
-    
+
     pthread_mutex_unlock(&st->download_queue.mutex);
-    
-    if (pending_count == 0) return;
-    
-    // Draw at the right side of the now playing bar
-    char dl_status[64];
-    char spinner = get_spinner_char(st->spinner_frame);
-    
-    if (failed > 0) {
-        snprintf(dl_status, sizeof(dl_status), "[%c %d/%d %d!]", 
-                 spinner, completed, completed + pending_count, failed);
-    } else {
-        snprintf(dl_status, sizeof(dl_status), "[%c %d/%d]", 
-                 spinner, completed, completed + pending_count);
+
+    if (pending_count > 0) {
+        char queue_status[64];
+        if (failed > 0) {
+            snprintf(queue_status, sizeof(queue_status), "[%c %d/%d %d!]",
+                     spinner, completed, completed + pending_count, failed);
+        } else {
+            snprintf(queue_status, sizeof(queue_status), "[%c %d/%d]",
+                     spinner, completed, completed + pending_count);
+        }
+        if (status_parts > 0) {
+            // Append after update status
+            size_t cur_len = strlen(dl_status);
+            snprintf(dl_status + cur_len, sizeof(dl_status) - cur_len, " %s", queue_status);
+        } else {
+            snprintf(dl_status, sizeof(dl_status), "%s", queue_status);
+        }
+        status_parts++;
     }
-    
-    int x = cols - strlen(dl_status) - 1;
+
+    if (status_parts == 0) return;
+
+    int x = cols - (int)strlen(dl_status) - 1;
     if (x > 0) {
         mvprintw(rows - 1, x, "%s", dl_status);
     }
@@ -2230,7 +2628,7 @@ static void draw_about_view(AppState *st, const char *status, int rows, int cols
 
     // Title
     attron(A_BOLD | A_REVERSE);
-    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.4");
+    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.5");
     attroff(A_BOLD | A_REVERSE);
 
     // Version and description
@@ -2358,7 +2756,7 @@ static void show_help(void) {
     
     int y = 2;
     attron(A_BOLD);
-    mvprintw(y++, 2, "ShellBeats v0.4 | Help");
+    mvprintw(y++, 2, "ShellBeats v0.5 | Help");
     attroff(A_BOLD);
     y++;
     
@@ -2398,23 +2796,29 @@ static void show_help(void) {
     timeout(100);
 }
 
-static bool check_dependencies(char *errmsg, size_t errsz) {
-    FILE *fp = popen("which yt-dlp 2>/dev/null", "r");
-    if (fp) {
-        char buf[256];
-        bool found = (fgets(buf, sizeof(buf), fp) != NULL && buf[0] == '/');
-        pclose(fp);
-        if (!found) {
-            snprintf(errmsg, errsz, "yt-dlp not found! Install with: pip install yt-dlp");
-            return false;
+static bool check_dependencies(AppState *st, char *errmsg, size_t errsz) {
+    // yt-dlp: accept local binary OR system binary
+    bool ytdlp_found = false;
+    if (st->ytdlp_has_local && file_exists(st->ytdlp_local_path)) {
+        ytdlp_found = true;
+    } else {
+        FILE *fp = popen("which yt-dlp 2>/dev/null", "r");
+        if (fp) {
+            char buf[256];
+            ytdlp_found = (fgets(buf, sizeof(buf), fp) != NULL && buf[0] == '/');
+            pclose(fp);
         }
     }
+    if (!ytdlp_found && !st->ytdlp_updating) {
+        snprintf(errmsg, errsz, "yt-dlp not found! Will be downloaded automatically on next start.");
+        return false;
+    }
     
-    fp = popen("which mpv 2>/dev/null", "r");
-    if (fp) {
+    FILE *mpv_fp = popen("which mpv 2>/dev/null", "r");
+    if (mpv_fp) {
         char buf[256];
-        bool found = (fgets(buf, sizeof(buf), fp) != NULL && buf[0] == '/');
-        pclose(fp);
+        bool found = (fgets(buf, sizeof(buf), mpv_fp) != NULL && buf[0] == '/');
+        pclose(mpv_fp);
         if (!found) {
             snprintf(errmsg, errsz, "mpv not found! Install with: apt install mpv");
             return false;
@@ -2428,25 +2832,54 @@ static bool check_dependencies(char *errmsg, size_t errsz) {
 // Main
 // ============================================================================
 
-int main(void) {
+int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
-    
+
+    // Check for -log flag
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-log") == 0 || strcmp(argv[i], "--log") == 0) {
+            // Open log file early (before config dirs, use HOME directly)
+            const char *home = getenv("HOME");
+            if (!home) home = "/tmp";
+            char log_path[1024];
+            snprintf(log_path, sizeof(log_path), "%s/.shellbeats/shellbeats.log", home);
+            // Ensure .shellbeats exists
+            char config_dir[1024];
+            snprintf(config_dir, sizeof(config_dir), "%s/.shellbeats", home);
+            mkdir(config_dir, 0755);
+            g_log_file = fopen(log_path, "a");
+            if (g_log_file) {
+                sb_log("========================================");
+                sb_log("ShellBeats v0.5 started with -log");
+                sb_log("HOME=%s", home);
+            } else {
+                fprintf(stderr, "Warning: could not open log file: %s\n", log_path);
+            }
+            break;
+        }
+    }
+
     AppState st = {0};
     st.playing_index = -1;
     st.playing_playlist_idx = -1;
     st.current_playlist_idx = -1;
     st.view = VIEW_SEARCH;
-    
+
     // NEW: Initialize download queue mutex
     pthread_mutex_init(&st.download_queue.mutex, NULL);
     st.download_queue.current_idx = -1;
     g_app_state = &st;
-    
+
     // Initialize config directories
+    sb_log("Initializing config directories...");
     if (!init_config_dirs(&st)) {
+        sb_log("FATAL: init_config_dirs failed");
         fprintf(stderr, "Failed to initialize config directory\n");
         return 1;
     }
+    sb_log("Config dir: %s", st.config_dir);
+    sb_log("yt-dlp bin dir: %s (exists=%s)", st.ytdlp_bin_dir, dir_exists(st.ytdlp_bin_dir) ? "yes" : "no");
+    sb_log("yt-dlp local path: %s", st.ytdlp_local_path);
     
     // NEW: Load configuration
     load_config(&st);
@@ -2461,7 +2894,11 @@ int main(void) {
     if (get_pending_download_count(&st) > 0) {
         start_download_thread(&st);
     }
-    
+
+    // Start yt-dlp auto-update in background
+    sb_log("Starting yt-dlp auto-update thread...");
+    start_ytdlp_update(&st);
+
     initscr();
     cbreak();
     noecho();
@@ -2473,7 +2910,7 @@ int main(void) {
     
     char status[512] = "";
     
-    if (!check_dependencies(status, sizeof(status))) {
+    if (!check_dependencies(&st, status, sizeof(status))) {
         draw_ui(&st, status);
         timeout(-1);
         getch();
@@ -2941,9 +3378,10 @@ int main(void) {
 
                             char fetched_title[256] = {0};
                             Song temp_songs[MAX_PLAYLIST_ITEMS];
-                            int fetched = fetch_youtube_playlist(url, temp_songs, MAX_PLAYLIST_ITEMS, 
+                            int fetched = fetch_youtube_playlist(url, temp_songs, MAX_PLAYLIST_ITEMS,
                                                                  fetched_title, sizeof(fetched_title),
-                                                                 youtube_fetch_progress_callback, status);
+                                                                 youtube_fetch_progress_callback, status,
+                                                                 get_ytdlp_cmd(&st));
                             if (fetched <= 0) {
                                 snprintf(status, sizeof(status), "Failed to fetch playlist");
                                 break;
@@ -3236,14 +3674,21 @@ int main(void) {
     
     // NEW: Stop download thread
     stop_download_thread(&st);
+    stop_ytdlp_update(&st);
     pthread_mutex_destroy(&st.download_queue.mutex);
-    
+
     endwin();
     
     // Cleanup
     free_search_results(&st);
     free_all_playlists(&st);
     mpv_quit();
-    
+
+    sb_log("ShellBeats exiting normally");
+    if (g_log_file) {
+        fclose(g_log_file);
+        g_log_file = NULL;
+    }
+
     return 0;
 }

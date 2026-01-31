@@ -5,11 +5,17 @@ https://shellbeats.com
 
 ## Updates
 
-**v0.4** 
-- Now you can download or stream an entire playlists from youtube just pasting the link on terminal, thanks to ***kathiravanbtm*** [**More details**](YOUTUBE_PLAYLIST_GUIDE.md)
+**v0.5**
+- Fixed streaming on systems where mpv couldn't find yt-dlp: mpv now receives the correct yt-dlp path via `--script-opts=ytdl_hook-ytdl_path=...`, so streaming works even when yt-dlp is not in the system PATH.
+- Added detailed playback logging (enabled with `-log` flag). All playback operations are now traced with `[PLAYBACK]` prefix: mpv startup, IPC connection, URL loading, search commands, track end detection, and stream errors. Useful for debugging playback issues on different systems.
+- YouTube Playlist integration is now documented in this README (see below).
 - Some bugfixes.
 
-# shellbeats V0.4
+**v0.4**
+- Now you can download or stream entire playlists from YouTube just by pasting the link in the terminal, thanks to ***kathiravanbtm***.
+- Some bugfixes.
+
+# shellbeats V0.5
 
 ![Demo](shellbeats.gif)
 
@@ -96,6 +102,10 @@ Playlists are stored as simple JSON files:
 ├── config.json             # app configuration (download path)
 ├── playlists.json          # index of all playlists
 ├── download_queue.json     # pending downloads
+├── shellbeats.log          # runtime log (when started with -log)
+├── yt-dlp.version          # version of the local yt-dlp binary
+├── bin/
+│   └── yt-dlp              # auto-managed local yt-dlp binary
 └── playlists/
     ├── chill_vibes.json    # individual playlist
     ├── workout.json
@@ -117,12 +127,81 @@ Downloaded files:
 
 Each playlist file just contains the song title and YouTube video ID. When you play a song shellbeats reconstructs the URL from the ID. Simple and easy to edit by hand if you ever need to.
 
+### Logging
+
+Run shellbeats with the `-log` flag to enable detailed logging:
+
+```bash
+shellbeats -log
+```
+
+Logs are written to `~/.shellbeats/shellbeats.log`. All playback operations are traced with a `[PLAYBACK]` prefix, which makes it easy to filter:
+
+```bash
+tail -f ~/.shellbeats/shellbeats.log | grep PLAYBACK
+```
+
+What gets logged:
+
+- **mpv lifecycle**: process start, IPC socket connection, disconnection, shutdown
+- **Playback commands**: every command sent to mpv (loadfile, pause, stop)
+- **URL loading**: which URL or local file is being loaded, and whether it's streaming or playing from disk
+- **Search**: yt-dlp command executed, number of results found
+- **Track navigation**: next/previous track, current index
+- **Errors**: connection failures, stream errors (`end-file` with `reason: error`), socket issues
+
+This is useful for debugging playback issues, especially on systems where streaming doesn't work. A typical failure looks like:
+
+```
+[PLAYBACK] mpv_check_track_end: WARNING - track ended with ERROR
+```
+
+which usually means mpv can't resolve the YouTube URL (yt-dlp not found, network issue, etc.).
+
+## YouTube Playlist Integration
+
+You can import entire YouTube playlists into shellbeats, either for streaming or for download.
+
+### How to use
+
+1. Press `f` to open the playlists menu
+2. Press `p` to add a YouTube playlist
+3. Paste a YouTube playlist URL (e.g. `https://www.youtube.com/playlist?list=PL...`)
+4. Enter a name for the playlist (or press Enter to use the original YouTube title)
+5. Choose mode: `s` to stream only, or `d` to download all songs
+
+### YouTube playlist controls
+
+| Key | Context | Action |
+|-----|---------|--------|
+| `p` | Playlists menu | Import a YouTube playlist |
+| `D` | Inside a YouTube playlist | Download all songs in the playlist |
+
+- Imported playlists show a `[YT]` indicator in the UI
+- In **stream mode**, songs play directly from YouTube (no disk usage)
+- In **download mode**, all songs are queued for background download
+- You can always download later by opening the playlist and pressing `D`
+- Playlist type (youtube/local) is persisted in the JSON file
+
+> YouTube Playlist integration contributed by ***kathiravanbtm***
+
 ## Dependencies
 
 - `mpv` - audio playback
-- `yt-dlp` - YouTube search, streaming and downloading
+- `yt-dlp` - YouTube search, streaming and downloading (auto-managed, see below)
 - `ncurses` - terminal UI
 - `pthread` - background downloads
+- `curl` or `wget` - needed for yt-dlp auto-update (at least one must be installed)
+
+### yt-dlp auto-update
+
+shellbeats manages its own local copy of yt-dlp independently from the system one. At startup a background thread:
+
+1. Checks the latest yt-dlp release on GitHub (via `curl`, or `wget` as fallback)
+2. Compares it with the local version stored in `~/.shellbeats/yt-dlp.version`
+3. If outdated (or missing), downloads the new binary to `~/.shellbeats/bin/yt-dlp` and marks it executable
+
+When running commands (search, download, streaming), shellbeats uses the local binary if available, otherwise falls back to the system `yt-dlp`. This means the system-installed `yt-dlp` package is only needed as a safety net — shellbeats will keep itself up to date automatically as long as `curl` or `wget` is present.
 
 ## Setup
 
@@ -141,7 +220,7 @@ sudo pacman -S mpv ncurses yt-dlp
 ```bash
 brew install mpv yt-dlp
 ```
-> 🛈 This setup has not been personally tested by the author, but the community confirms there are no compilation issues.
+> Note: This setup has not been personally tested by the author, but the community confirms there are no compilation issues.
 
 
 
@@ -191,9 +270,11 @@ All shortcuts are now visible in the header when you run shellbeats. Heres the c
 | `f` | Open playlists menu |
 | `a` | Add current song to a playlist |
 | `c` | Create new playlist |
+| `p` | Import YouTube playlist |
 | `r` | Remove song from playlist |
 | `x` | Delete playlist (including folder & downloaded files) |
 | `d` | Download song or entire playlist |
+| `D` | Download all songs (YouTube playlists) |
 
 ### Other
 
@@ -208,11 +289,13 @@ All shortcuts are now visible in the header when you run shellbeats. Heres the c
 - **Offline Mode**: Download songs and play them without internet
 - **Smart Playback**: Automatically plays from disk when available
 - **Background Downloads**: Keep using the app while downloads run
-- **Visual Feedback**: `[D]` marker shows downloaded songs, spinner shows active downloads
+- **YouTube Playlists**: Import entire playlists for streaming or download
+- **Visual Feedback**: `[D]` marker shows downloaded songs, `[YT]` marks YouTube playlists, spinner shows active downloads
 - **Organized Storage**: Each playlist gets its own folder
 - **Clean Deletion**: Removing a playlist deletes its folder and all files
 - **Persistent Queue**: Resume interrupted downloads on restart
 - **Duplicate Prevention**: Won't download the same song twice
+- **Debug Logging**: Detailed playback logs with `-log` flag for troubleshooting
 
 ## BUGS
 
