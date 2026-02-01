@@ -298,8 +298,7 @@ All shortcuts are now visible in the header when you run shellbeats. Heres the c
 - **Debug Logging**: Detailed playback logs with `-log` flag for troubleshooting
 
 ## BUGS
-
-No known bugs at the moment! If you find something please open an issue.
+If you created a playlist in one of previous sessions, then when you save a track to the playlist, it displays the number of already saved tracks as (0).
 
 ## TODO
 Find a way to use an "AI agent" to find the music on Youtube and turn it into a Shellbeats playlist
