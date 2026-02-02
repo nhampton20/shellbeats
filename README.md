@@ -303,12 +303,19 @@ Small bug with PAUSE command tracking, sometimes the UI reverts the [PAUSE] mess
 
 ## TODO
 Find a way to use an "AI agent" to find the music on Youtube and turn it into a Shellbeats playlist.
+
 Edit playlist name.
+
 Start Shellbeats from where it was left before (playlist/music/timestmap).
+
 Randomize musics in playlist.
+
 [--:--] never shows duration of the video.
+
 Auto fetch new songs on youtube playlist sync.
+
 Jumping x sec forward/backward (default: 10)
+
 Jumping to time mm:ss
 
 
