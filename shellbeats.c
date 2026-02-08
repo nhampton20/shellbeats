@@ -57,6 +57,8 @@ typedef struct {
 // NEW: Configuration structure
 typedef struct {
     char download_path[1024];
+    int seek_step;           // Seek step in seconds (default 10)
+    bool remember_session;   // Remember last session on exit
 } Config;
 
 // NEW: Download task status
@@ -169,6 +171,21 @@ typedef struct {
     // NEW: Spinner state for download progress
     int spinner_frame;
     time_t last_spinner_update;
+
+    // Shuffle mode
+    bool shuffle_mode;
+
+    // Seek step in seconds (configurable)
+    int seek_step;
+
+    // Remember session
+    bool remember_session;
+    char last_query[256];
+    Song cached_search[MAX_RESULTS];
+    int cached_search_count;
+    int last_playlist_idx;
+    int last_song_idx;
+    bool was_playing_playlist;
 } AppState;
 
 // ============================================================================
@@ -756,57 +773,131 @@ static void stop_ytdlp_update(AppState *st) {
 static void init_default_config(AppState *st) {
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
-    
+
     // Default download path: ~/Music/shellbeats
-    snprintf(st->config.download_path, sizeof(st->config.download_path), 
+    snprintf(st->config.download_path, sizeof(st->config.download_path),
              "%s/Music/shellbeats", home);
+
+    // Default seek step: 10 seconds
+    st->config.seek_step = 10;
+
+    // Default: don't remember session
+    st->config.remember_session = false;
 }
 
 static void save_config(AppState *st) {
     FILE *f = fopen(st->config_file, "w");
     if (!f) return;
-    
+
     char *escaped_path = json_escape_string(st->config.download_path);
-    
+    char *escaped_query = json_escape_string(st->last_query);
+
     fprintf(f, "{\n");
-    fprintf(f, "  \"download_path\": \"%s\"\n", escaped_path ? escaped_path : "");
+    fprintf(f, "  \"download_path\": \"%s\",\n", escaped_path ? escaped_path : "");
+    fprintf(f, "  \"seek_step\": %d,\n", st->config.seek_step);
+    fprintf(f, "  \"remember_session\": %s,\n", st->config.remember_session ? "true" : "false");
+    fprintf(f, "  \"shuffle_mode\": %s,\n", st->shuffle_mode ? "true" : "false");
+
+    // Session state (only saved if remember_session is enabled)
+    if (st->config.remember_session) {
+        fprintf(f, "  \"last_query\": \"%s\",\n", escaped_query ? escaped_query : "");
+        fprintf(f, "  \"last_playlist_idx\": %d,\n", st->last_playlist_idx);
+        fprintf(f, "  \"last_song_idx\": %d,\n", st->last_song_idx);
+        fprintf(f, "  \"was_playing_playlist\": %s,\n", st->was_playing_playlist ? "true" : "false");
+
+        // Save cached search results
+        fprintf(f, "  \"cached_search_count\": %d,\n", st->cached_search_count);
+        fprintf(f, "  \"cached_search\": [\n");
+        for (int i = 0; i < st->cached_search_count; i++) {
+            char *esc_title = json_escape_string(st->cached_search[i].title);
+            char *esc_vid = json_escape_string(st->cached_search[i].video_id);
+            char *esc_url = json_escape_string(st->cached_search[i].url);
+            fprintf(f, "    {\"title\": \"%s\", \"video_id\": \"%s\", \"url\": \"%s\", \"duration\": %d}%s\n",
+                    esc_title ? esc_title : "",
+                    esc_vid ? esc_vid : "",
+                    esc_url ? esc_url : "",
+                    st->cached_search[i].duration,
+                    (i < st->cached_search_count - 1) ? "," : "");
+            free(esc_title);
+            free(esc_vid);
+            free(esc_url);
+        }
+        fprintf(f, "  ]\n");
+    } else {
+        fprintf(f, "  \"last_query\": \"\",\n");
+        fprintf(f, "  \"cached_search_count\": 0,\n");
+        fprintf(f, "  \"cached_search\": []\n");
+    }
+
     fprintf(f, "}\n");
-    
+
     free(escaped_path);
+    free(escaped_query);
     fclose(f);
+}
+
+static int json_get_int(const char *json, const char *key, int default_val) {
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+
+    const char *p = strstr(json, pattern);
+    if (!p) return default_val;
+
+    p += strlen(pattern);
+    while (*p && (*p == ' ' || *p == ':' || *p == '\t')) p++;
+
+    if (!*p) return default_val;
+
+    // Check for true/false
+    if (strncmp(p, "true", 4) == 0) return 1;
+    if (strncmp(p, "false", 5) == 0) return 0;
+
+    return atoi(p);
+}
+
+static bool json_get_bool(const char *json, const char *key, bool default_val) {
+    return json_get_int(json, key, default_val ? 1 : 0) != 0;
 }
 
 static void load_config(AppState *st) {
     // Set defaults first
     init_default_config(st);
-    
+    st->config.seek_step = 10;
+    st->config.remember_session = false;
+    st->shuffle_mode = false;
+    st->last_query[0] = '\0';
+    st->cached_search_count = 0;
+    st->last_playlist_idx = -1;
+    st->last_song_idx = -1;
+    st->was_playing_playlist = false;
+
     FILE *f = fopen(st->config_file, "r");
     if (!f) {
         // No config file, save defaults
         save_config(st);
         return;
     }
-    
+
     // Read entire file
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    
-    if (fsize <= 0 || fsize > 64 * 1024) {
+
+    if (fsize <= 0 || fsize > 256 * 1024) {
         fclose(f);
         return;
     }
-    
+
     char *content = malloc(fsize + 1);
     if (!content) {
         fclose(f);
         return;
     }
-    
+
     size_t read_size = fread(content, 1, fsize, f);
     content[read_size] = '\0';
     fclose(f);
-    
+
     // Parse download_path
     char *download_path = json_get_string(content, "download_path");
     if (download_path && download_path[0]) {
@@ -814,7 +905,65 @@ static void load_config(AppState *st) {
         st->config.download_path[sizeof(st->config.download_path) - 1] = '\0';
     }
     free(download_path);
-    
+
+    // Parse new config options
+    st->config.seek_step = json_get_int(content, "seek_step", 10);
+    if (st->config.seek_step < 1) st->config.seek_step = 10;
+    if (st->config.seek_step > 300) st->config.seek_step = 300;
+
+    st->config.remember_session = json_get_bool(content, "remember_session", false);
+    st->shuffle_mode = json_get_bool(content, "shuffle_mode", false);
+
+    // Parse session state
+    char *last_query = json_get_string(content, "last_query");
+    if (last_query) {
+        strncpy(st->last_query, last_query, sizeof(st->last_query) - 1);
+        st->last_query[sizeof(st->last_query) - 1] = '\0';
+        free(last_query);
+    }
+
+    st->last_playlist_idx = json_get_int(content, "last_playlist_idx", -1);
+    st->last_song_idx = json_get_int(content, "last_song_idx", -1);
+    st->was_playing_playlist = json_get_bool(content, "was_playing_playlist", false);
+    st->cached_search_count = json_get_int(content, "cached_search_count", 0);
+    if (st->cached_search_count > MAX_RESULTS) st->cached_search_count = MAX_RESULTS;
+
+    // Parse cached search results
+    if (st->cached_search_count > 0) {
+        const char *arr = strstr(content, "\"cached_search\"");
+        if (arr) {
+            arr = strchr(arr, '[');
+            if (arr) {
+                arr++;
+                for (int i = 0; i < st->cached_search_count; i++) {
+                    const char *obj_start = strchr(arr, '{');
+                    if (!obj_start) break;
+                    const char *obj_end = strchr(obj_start, '}');
+                    if (!obj_end) break;
+
+                    size_t obj_len = obj_end - obj_start + 1;
+                    char *obj = malloc(obj_len + 1);
+                    if (!obj) break;
+                    memcpy(obj, obj_start, obj_len);
+                    obj[obj_len] = '\0';
+
+                    char *title = json_get_string(obj, "title");
+                    char *vid = json_get_string(obj, "video_id");
+                    char *url = json_get_string(obj, "url");
+                    int dur = json_get_int(obj, "duration", 0);
+
+                    st->cached_search[i].title = title;
+                    st->cached_search[i].video_id = vid;
+                    st->cached_search[i].url = url;
+                    st->cached_search[i].duration = dur;
+
+                    free(obj);
+                    arr = obj_end + 1;
+                }
+            }
+        }
+    }
+
     free(content);
 }
 
@@ -1237,12 +1386,13 @@ static void save_playlist(AppState *st, int idx) {
     for (int i = 0; i < pl->count; i++) {
         char *escaped_title = json_escape_string(pl->items[i].title);
         char *escaped_id = json_escape_string(pl->items[i].video_id);
-        
-        fprintf(f, "    {\"title\": \"%s\", \"video_id\": \"%s\"}%s\n",
+
+        fprintf(f, "    {\"title\": \"%s\", \"video_id\": \"%s\", \"duration\": %d}%s\n",
                 escaped_title ? escaped_title : "",
                 escaped_id ? escaped_id : "",
+                pl->items[i].duration,
                 (i < pl->count - 1) ? "," : "");
-        
+
         free(escaped_title);
         free(escaped_id);
     }
@@ -1319,15 +1469,16 @@ static void load_playlist_songs(AppState *st, int idx) {
         
         char *title = json_get_string(obj, "title");
         char *video_id = json_get_string(obj, "video_id");
-        
+        int duration = json_get_int(obj, "duration", 0);
+
         if (title && video_id && video_id[0]) {
             pl->items[pl->count].title = title;
             pl->items[pl->count].video_id = video_id;
-            
+
             char url[256];
             snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video_id);
             pl->items[pl->count].url = strdup(url);
-            pl->items[pl->count].duration = 0;
+            pl->items[pl->count].duration = duration;
             
             pl->count++;
         } else {
@@ -1663,6 +1814,20 @@ static void mpv_stop_playback(void) {
     mpv_send_command("{\"command\":[\"stop\"]}");
 }
 
+static void mpv_seek(int seconds) {
+    sb_log("[PLAYBACK] mpv_seek: seeking %+d seconds", seconds);
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "{\"command\":[\"seek\",\"%d\",\"relative\"]}", seconds);
+    mpv_send_command(cmd);
+}
+
+static void mpv_seek_absolute(int seconds) {
+    sb_log("[PLAYBACK] mpv_seek_absolute: seeking to %d seconds", seconds);
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "{\"command\":[\"seek\",\"%d\",\"absolute\"]}", seconds);
+    mpv_send_command(cmd);
+}
+
 static void mpv_load_url(const char *url) {
     sb_log("[PLAYBACK] mpv_load_url: loading URL: %s", url);
 
@@ -1851,7 +2016,7 @@ static int run_search(AppState *st, const char *raw_query) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
              "%s --flat-playlist --quiet --no-warnings "
-             "--print '%%(title)s|||%%(id)s' "
+             "--print '%%(title)s|||%%(id)s|||%%(duration)s' "
              "\"ytsearch%d:%s\" 2>/dev/null",
              get_ytdlp_cmd(st), MAX_RESULTS, escaped_query);
 
@@ -1877,25 +2042,30 @@ static int run_search(AppState *st, const char *raw_query) {
         if (strncmp(line, "ERROR", 5) == 0) continue;
         if (strncmp(line, "WARNING", 7) == 0) continue;
         
-        char *sep = strstr(line, "|||");
-        if (!sep) continue;
-        *sep = '\0';
-        
+        char *sep1 = strstr(line, "|||");
+        if (!sep1) continue;
+        *sep1 = '\0';
+
+        char *sep2 = strstr(sep1 + 3, "|||");
+        if (!sep2) continue;
+        *sep2 = '\0';
+
         const char *title = line;
-        const char *video_id = sep + 3;
+        const char *video_id = sep1 + 3;
+        const char *duration_str = sep2 + 3;
         if (!video_id[0]) continue;
-        
+
         size_t id_len = strlen(video_id);
         if (id_len < 5 || id_len > 20) continue;
-        
+
         st->search_results[count].title = strdup(title);
         st->search_results[count].video_id = strdup(video_id);
-        
+
         char fullurl[256];
-        snprintf(fullurl, sizeof(fullurl), 
+        snprintf(fullurl, sizeof(fullurl),
                  "https://www.youtube.com/watch?v=%s", video_id);
         st->search_results[count].url = strdup(fullurl);
-        st->search_results[count].duration = 0;
+        st->search_results[count].duration = atoi(duration_str);
         
         if (st->search_results[count].title && 
             st->search_results[count].video_id &&
@@ -2005,23 +2175,56 @@ static void play_playlist_song(AppState *st, int playlist_idx, int song_idx) {
     sb_log("[PLAYBACK] play_playlist_song: playback started");
 }
 
+static int get_random_index(int count, int current) {
+    if (count <= 1) return 0;
+    int next;
+    do {
+        next = rand() % count;
+    } while (next == current && count > 1);
+    return next;
+}
+
 static void play_next(AppState *st) {
-    sb_log("[PLAYBACK] play_next: current index=%d, from_playlist=%d, playlist_idx=%d",
-           st->playing_index, st->playing_from_playlist, st->playing_playlist_idx);
+    sb_log("[PLAYBACK] play_next: current index=%d, from_playlist=%d, playlist_idx=%d, shuffle=%d",
+           st->playing_index, st->playing_from_playlist, st->playing_playlist_idx, st->shuffle_mode);
     if (st->playing_from_playlist && st->playing_playlist_idx >= 0) {
         Playlist *pl = &st->playlists[st->playing_playlist_idx];
-        int next = st->playing_index + 1;
+        int next;
+        if (st->shuffle_mode) {
+            next = get_random_index(pl->count, st->playing_index);
+            sb_log("[PLAYBACK] play_next: shuffle mode, random index=%d/%d", next, pl->count);
+        } else {
+            next = st->playing_index + 1;
+        }
         if (next < pl->count) {
             sb_log("[PLAYBACK] play_next: advancing to playlist song #%d/%d", next, pl->count);
+            play_playlist_song(st, st->playing_playlist_idx, next);
+            st->playlist_song_selected = next;
+        } else if (st->shuffle_mode) {
+            // In shuffle mode, loop back
+            next = get_random_index(pl->count, st->playing_index);
+            sb_log("[PLAYBACK] play_next: shuffle loop, random index=%d/%d", next, pl->count);
             play_playlist_song(st, st->playing_playlist_idx, next);
             st->playlist_song_selected = next;
         } else {
             sb_log("[PLAYBACK] play_next: already at last song in playlist (%d/%d)", st->playing_index, pl->count);
         }
     } else if (st->search_count > 0) {
-        int next = st->playing_index + 1;
+        int next;
+        if (st->shuffle_mode) {
+            next = get_random_index(st->search_count, st->playing_index);
+            sb_log("[PLAYBACK] play_next: shuffle mode, random search index=%d/%d", next, st->search_count);
+        } else {
+            next = st->playing_index + 1;
+        }
         if (next < st->search_count) {
             sb_log("[PLAYBACK] play_next: advancing to search result #%d/%d", next, st->search_count);
+            play_search_result(st, next);
+            st->search_selected = next;
+        } else if (st->shuffle_mode) {
+            // In shuffle mode, loop back
+            next = get_random_index(st->search_count, st->playing_index);
+            sb_log("[PLAYBACK] play_next: shuffle loop, random search index=%d/%d", next, st->search_count);
             play_search_result(st, next);
             st->search_selected = next;
         } else {
@@ -2077,29 +2280,29 @@ static void format_duration(int sec, char out[16]) {
 static void draw_header(int cols, ViewMode view) {
     // Line 1: Title
     attron(A_BOLD);
-    mvprintw(0, 0, " ShellBeats v0.5 ");
+    mvprintw(0, 0, " ShellBeats v0.6 ");
     attroff(A_BOLD);
 
     // Line 2-3: Shortcuts (two lines)
     switch (view) {
         case VIEW_SEARCH:
-            mvprintw(1, 0, "  /,s: search | Enter: play | Space: pause | n: next | p: prev | x: stop");
-            mvprintw(2, 0, "  a: add to playlist | d: download | c: create playlist | f: playlists | S: settings | i: about | q: quit");
+            mvprintw(1, 0, "  /,s: search | Enter: play | Space: pause | n/p: next/prev | R: shuffle | t: jump");
+            mvprintw(2, 0, "  Left/Right: seek | a: add | d: download | f: playlists | S: settings | q: quit");
             break;
         case VIEW_PLAYLISTS:
-            mvprintw(1, 0, "  Enter: open | d: download all | c: create | p: add YouTube | x: delete");
+            mvprintw(1, 0, "  Enter: open | c: create | e: rename | p: add YouTube | x: delete | d: download all");
             mvprintw(2, 0, "  Esc: back | i: about | q: quit");
             break;
         case VIEW_PLAYLIST_SONGS:
-            mvprintw(1, 0, "  Enter: play | Space: pause | n: next | p: prev | x: stop");
-            mvprintw(2, 0, "  a: add song | d: download | r: remove | D: download all (YT) | Esc: back | i: about | q: quit");
+            mvprintw(1, 0, "  Enter: play | Space: pause | n/p: next/prev | R: shuffle | t: jump | Left/Right: seek");
+            mvprintw(2, 0, "  a: add | d: download | r: remove | D: download all | Esc: back | q: quit");
             break;
         case VIEW_ADD_TO_PLAYLIST:
             mvprintw(1, 0, "  Enter: add to playlist | c: create new playlist");
             mvprintw(2, 0, "  Esc: cancel");
             break;
         case VIEW_SETTINGS:
-            mvprintw(1, 0, "  Enter: edit download path");
+            mvprintw(1, 0, "  Up/Down: navigate | Enter: edit/toggle");
             mvprintw(2, 0, "  Esc: back | i: about | q: quit");
             break;
         case VIEW_ABOUT:
@@ -2206,6 +2409,9 @@ static void draw_now_playing(AppState *st, int rows, int cols) {
         
         if (st->paused) {
             printw(" [PAUSED]");
+        }
+        if (st->shuffle_mode) {
+            printw(" [SHUFFLE]");
         }
     }
     
@@ -2510,21 +2716,21 @@ static void draw_settings_view(AppState *st, const char *status, int rows, int c
     mvhline(6, 0, ACS_HLINE, cols);
 
     int y = 8;
-    
-    // Download Path setting
+
+    // Setting 0: Download Path
     bool is_selected = (st->settings_selected == 0);
-    
+
     mvprintw(y, 2, "Download Path:");
     y++;
-    
+
     if (is_selected) {
         attron(A_REVERSE);
     }
-    
+
     if (st->settings_editing && is_selected) {
         // Show edit buffer with cursor
         mvprintw(y, 4, "%-*s", cols - 8, st->settings_edit_buffer);
-        
+
         // Position cursor
         move(y, 4 + st->settings_edit_pos);
         curs_set(1);
@@ -2534,7 +2740,7 @@ static void draw_settings_view(AppState *st, const char *status, int rows, int c
         char pathbuf[1024];
         strncpy(pathbuf, st->config.download_path, sizeof(pathbuf) - 1);
         pathbuf[sizeof(pathbuf) - 1] = '\0';
-        
+
         if ((int)strlen(pathbuf) > max_path && max_path > 3) {
             // Truncate from the beginning to show the end of the path
             int offset = strlen(pathbuf) - max_path + 3;
@@ -2543,21 +2749,42 @@ static void draw_settings_view(AppState *st, const char *status, int rows, int c
             pathbuf[1] = '.';
             pathbuf[2] = '.';
         }
-        
+
         mvprintw(y, 4, "%s", pathbuf);
         curs_set(0);
     }
-    
+
     if (is_selected) {
         attroff(A_REVERSE);
     }
-    
+
     y += 2;
-    
+
+    // Setting 1: Seek Step
+    is_selected = (st->settings_selected == 1);
+    if (is_selected) attron(A_REVERSE);
+    mvprintw(y, 2, "Seek Step (seconds): %d", st->config.seek_step);
+    if (is_selected) attroff(A_REVERSE);
+    y += 2;
+
+    // Setting 2: Remember Session
+    is_selected = (st->settings_selected == 2);
+    if (is_selected) attron(A_REVERSE);
+    mvprintw(y, 2, "Remember Session: %s", st->config.remember_session ? "ON" : "OFF");
+    if (is_selected) attroff(A_REVERSE);
+    y += 2;
+
+    // Setting 3: Shuffle Mode
+    is_selected = (st->settings_selected == 3);
+    if (is_selected) attron(A_REVERSE);
+    mvprintw(y, 2, "Shuffle Mode: %s", st->shuffle_mode ? "ON" : "OFF");
+    if (is_selected) attroff(A_REVERSE);
+    y += 2;
+
     // Help text
-    mvprintw(y, 2, "Press Enter to edit, Esc to go back");
+    mvprintw(y, 2, "Up/Down: navigate | Enter: edit/toggle | Esc: back");
     y++;
-    
+
     if (st->settings_editing) {
         mvprintw(y, 2, "Editing: Enter to save, Esc to cancel");
     }
@@ -2628,7 +2855,7 @@ static void draw_about_view(AppState *st, const char *status, int rows, int cols
 
     // Title
     attron(A_BOLD | A_REVERSE);
-    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.5");
+    mvprintw(start_y + 2, start_x + (dialog_w - 15) / 2, " ShellBeats v0.6");
     attroff(A_BOLD | A_REVERSE);
 
     // Version and description
@@ -2753,43 +2980,52 @@ static void show_help(void) {
     int rows, cols;
     getmaxyx(stdscr, rows, cols);
     (void)cols;
-    
+
     int y = 2;
     attron(A_BOLD);
-    mvprintw(y++, 2, "ShellBeats v0.5 | Help");
+    mvprintw(y++, 2, "ShellBeats v0.6 | Help");
     attroff(A_BOLD);
     y++;
-    
-    mvprintw(y++, 4, "GLOBAL CONTROLS:");
-    mvprintw(y++, 6, "/           Search YouTube");
-    mvprintw(y++, 6, "Enter       Play selected / Open playlist");
-    mvprintw(y++, 6, "Space       Pause/Resume playback");
-    mvprintw(y++, 6, "n           Next track");
-    mvprintw(y++, 6, "p           Previous track");
+
+    mvprintw(y++, 4, "PLAYBACK:");
+    mvprintw(y++, 6, "/,s         Search YouTube");
+    mvprintw(y++, 6, "Enter       Play selected");
+    mvprintw(y++, 6, "Space       Pause/Resume");
+    mvprintw(y++, 6, "n/p         Next/Previous track");
     mvprintw(y++, 6, "x           Stop playback");
+    mvprintw(y++, 6, "R           Toggle shuffle mode");
+    mvprintw(y++, 6, "Left/Right  Seek backward/forward");
+    mvprintw(y++, 6, "t           Jump to time (mm:ss)");
+    y++;
+
+    mvprintw(y++, 4, "NAVIGATION:");
     mvprintw(y++, 6, "Up/Down/j/k Navigate list");
     mvprintw(y++, 6, "PgUp/PgDn   Page up/down");
     mvprintw(y++, 6, "g/G         Go to start/end");
-    mvprintw(y++, 6, "S           Settings");  // NEW
-    mvprintw(y++, 6, "h or ?      Show this help");
-    mvprintw(y++, 6, "q           Quit");
+    mvprintw(y++, 6, "Esc         Go back");
     y++;
-    
-    mvprintw(y++, 4, "PLAYLIST CONTROLS:");
+
+    mvprintw(y++, 4, "PLAYLISTS:");
     mvprintw(y++, 6, "f           Open playlists menu");
     mvprintw(y++, 6, "a           Add song to playlist");
     mvprintw(y++, 6, "c           Create new playlist");
-    mvprintw(y++, 6, "d           Remove song from playlist");
+    mvprintw(y++, 6, "e           Rename playlist");
+    mvprintw(y++, 6, "r           Remove song from playlist");
+    mvprintw(y++, 6, "d/D         Download song / Download all");
+    mvprintw(y++, 6, "p           Import YouTube playlist");
     mvprintw(y++, 6, "x           Delete playlist");
-    mvprintw(y++, 6, "Esc         Go back");
     y++;
-    
-    mvprintw(y++, 4, "Requirements: yt-dlp, mpv");
-    
+
+    mvprintw(y++, 4, "OTHER:");
+    mvprintw(y++, 6, "S           Settings");
+    mvprintw(y++, 6, "i           About");
+    mvprintw(y++, 6, "h,?         Show this help");
+    mvprintw(y++, 6, "q           Quit");
+
     attron(A_REVERSE);
     mvprintw(rows - 2, 2, " Press any key to continue... ");
     attroff(A_REVERSE);
-    
+
     refresh();
     timeout(-1);
     getch();
@@ -2835,6 +3071,9 @@ static bool check_dependencies(AppState *st, char *errmsg, size_t errsz) {
 int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
 
+    // Initialize random seed for shuffle mode
+    srand((unsigned int)time(NULL));
+
     // Check for -log flag
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-log") == 0 || strcmp(argv[i], "--log") == 0) {
@@ -2850,7 +3089,7 @@ int main(int argc, char *argv[]) {
             g_log_file = fopen(log_path, "a");
             if (g_log_file) {
                 sb_log("========================================");
-                sb_log("ShellBeats v0.5 started with -log");
+                sb_log("ShellBeats v0.6 started with -log");
                 sb_log("HOME=%s", home);
             } else {
                 fprintf(stderr, "Warning: could not open log file: %s\n", log_path);
@@ -2919,9 +3158,45 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    snprintf(status, sizeof(status), "Press / to search, d to download, f for playlists, h for help.");
+    // Restore session if remember_session is enabled
+    if (st.config.remember_session) {
+        if (st.was_playing_playlist && st.last_playlist_idx >= 0 &&
+            st.last_playlist_idx < st.playlist_count) {
+            // Restore playlist view
+            st.current_playlist_idx = st.last_playlist_idx;
+            load_playlist_songs(&st, st.current_playlist_idx);
+            if (st.last_song_idx >= 0 && st.last_song_idx < st.playlists[st.current_playlist_idx].count) {
+                st.playlist_song_selected = st.last_song_idx;
+            }
+            st.view = VIEW_PLAYLIST_SONGS;
+            snprintf(status, sizeof(status), "Resuming: %s, track %d",
+                     st.playlists[st.current_playlist_idx].name,
+                     st.last_song_idx + 1);
+        } else if (st.cached_search_count > 0 && st.last_query[0]) {
+            // Restore search results from cache
+            for (int i = 0; i < st.cached_search_count && i < MAX_RESULTS; i++) {
+                st.search_results[i] = st.cached_search[i];
+                // Clear cached pointers so they won't be double-freed
+                st.cached_search[i].title = NULL;
+                st.cached_search[i].video_id = NULL;
+                st.cached_search[i].url = NULL;
+            }
+            st.search_count = st.cached_search_count;
+            strncpy(st.query, st.last_query, sizeof(st.query) - 1);
+            if (st.last_song_idx >= 0 && st.last_song_idx < st.search_count) {
+                st.search_selected = st.last_song_idx;
+            }
+            st.view = VIEW_SEARCH;
+            snprintf(status, sizeof(status), "Resuming: search '%s', track %d",
+                     st.query, st.last_song_idx + 1);
+        } else {
+            snprintf(status, sizeof(status), "Press / to search, d to download, f for playlists, h for help.");
+        }
+    } else {
+        snprintf(status, sizeof(status), "Press / to search, d to download, f for playlists, h for help.");
+    }
     draw_ui(&st, status);
-    
+
     bool running = true;
     
     while (running) {
@@ -3099,6 +3374,45 @@ int main(int argc, char *argv[]) {
             case 'h':
             case '?':
                 show_help();
+                break;
+
+            case 'R': // Toggle shuffle mode
+                st.shuffle_mode = !st.shuffle_mode;
+                snprintf(status, sizeof(status), "Shuffle: %s", st.shuffle_mode ? "ON" : "OFF");
+                break;
+
+            case KEY_LEFT:
+                // Seek backward (only when not editing in settings)
+                if (st.view != VIEW_SETTINGS && st.playing_index >= 0 && file_exists(IPC_SOCKET)) {
+                    mpv_seek(-st.config.seek_step);
+                    snprintf(status, sizeof(status), "<< -%ds", st.config.seek_step);
+                }
+                break;
+
+            case KEY_RIGHT:
+                // Seek forward (only when not editing in settings)
+                if (st.view != VIEW_SETTINGS && st.playing_index >= 0 && file_exists(IPC_SOCKET)) {
+                    mpv_seek(st.config.seek_step);
+                    snprintf(status, sizeof(status), ">> +%ds", st.config.seek_step);
+                }
+                break;
+
+            case 't': // Jump to time
+                if (st.playing_index >= 0 && file_exists(IPC_SOCKET)) {
+                    char time_input[16] = {0};
+                    int len = get_string_input(time_input, sizeof(time_input), "Jump to (mm:ss): ");
+                    if (len > 0) {
+                        int mins = 0, secs = 0;
+                        if (sscanf(time_input, "%d:%d", &mins, &secs) == 2 ||
+                            sscanf(time_input, "%d", &secs) == 1) {
+                            int total_secs = mins * 60 + secs;
+                            mpv_seek_absolute(total_secs);
+                            snprintf(status, sizeof(status), "Jump to %d:%02d", mins, secs);
+                        } else {
+                            snprintf(status, sizeof(status), "Invalid time format");
+                        }
+                    }
+                }
                 break;
 
             case 'i': // About
@@ -3362,7 +3676,96 @@ int main(int argc, char *argv[]) {
                             }
                         }
                         break;
-                    
+
+                    case 'e': // Rename playlist
+                        if (st.playlist_count > 0) {
+                            Playlist *pl = &st.playlists[st.playlist_selected];
+                            char new_name[256] = {0};
+                            char prompt[384];
+                            snprintf(prompt, sizeof(prompt), "Rename '%s' to: ", pl->name);
+                            int len = get_string_input(new_name, sizeof(new_name), prompt);
+                            if (len > 0) {
+                                // Check if name already exists
+                                bool exists = false;
+                                for (int i = 0; i < st.playlist_count; i++) {
+                                    if (i != st.playlist_selected &&
+                                        strcmp(st.playlists[i].name, new_name) == 0) {
+                                        exists = true;
+                                        break;
+                                    }
+                                }
+                                if (exists) {
+                                    snprintf(status, sizeof(status), "Playlist '%s' already exists", new_name);
+                                } else {
+                                    // Rename the playlist
+                                    char old_json_path[4096], new_json_path[4096];
+                                    char old_dl_path[4096], new_dl_path[4096];
+
+                                    // Build old and new JSON file paths
+                                    char old_filename[512], new_filename[512];
+                                    snprintf(old_filename, sizeof(old_filename), "%s", pl->filename);
+                                    // Create new filename from new name
+                                    size_t fn_idx = 0;
+                                    for (size_t i = 0; new_name[i] && fn_idx < sizeof(new_filename) - 6; i++) {
+                                        char c = new_name[i];
+                                        if (isalnum((unsigned char)c) || c == '-' || c == '_') {
+                                            new_filename[fn_idx++] = c;
+                                        } else if (c == ' ') {
+                                            new_filename[fn_idx++] = '_';
+                                        }
+                                    }
+                                    new_filename[fn_idx] = '\0';
+                                    strcat(new_filename, ".json");
+
+                                    snprintf(old_json_path, sizeof(old_json_path), "%s/%s",
+                                             st.playlists_dir, old_filename);
+                                    snprintf(new_json_path, sizeof(new_json_path), "%s/%s",
+                                             st.playlists_dir, new_filename);
+
+                                    // Build old and new download folder paths
+                                    snprintf(old_dl_path, sizeof(old_dl_path), "%s/%s",
+                                             st.config.download_path, pl->name);
+                                    snprintf(new_dl_path, sizeof(new_dl_path), "%s/%s",
+                                             st.config.download_path, new_name);
+
+                                    bool success = true;
+
+                                    // Rename JSON file
+                                    if (rename(old_json_path, new_json_path) != 0 && errno != ENOENT) {
+                                        success = false;
+                                    }
+
+                                    // Rename download folder (if exists)
+                                    if (success && dir_exists(old_dl_path)) {
+                                        if (rename(old_dl_path, new_dl_path) != 0) {
+                                            // Try to revert JSON rename
+                                            rename(new_json_path, old_json_path);
+                                            success = false;
+                                        }
+                                    }
+
+                                    if (success) {
+                                        // Update in-memory data
+                                        free(pl->name);
+                                        pl->name = strdup(new_name);
+                                        free(pl->filename);
+                                        pl->filename = strdup(new_filename);
+
+                                        // Save updated index and playlist
+                                        save_playlists_index(&st);
+                                        save_playlist(&st, st.playlist_selected);
+
+                                        snprintf(status, sizeof(status), "Renamed to '%s'", new_name);
+                                    } else {
+                                        snprintf(status, sizeof(status), "Failed to rename playlist");
+                                    }
+                                }
+                            } else {
+                                snprintf(status, sizeof(status), "Cancelled");
+                            }
+                        }
+                        break;
+
                     // NEW: Add YouTube playlist
                     case 'p': {
                         char url[512] = {0};
@@ -3638,25 +4041,49 @@ int main(int argc, char *argv[]) {
                 switch (ch) {
                     case KEY_UP:
                     case 'k':
-                        // For now only one setting, but prepared for more
                         if (st.settings_selected > 0) st.settings_selected--;
                         break;
-                    
+
                     case KEY_DOWN:
                     case 'j':
-                        // For now only one setting
+                        if (st.settings_selected < 3) st.settings_selected++;
                         break;
-                    
+
                     case '\n':
                     case KEY_ENTER:
-                        // Enter edit mode
                         if (st.settings_selected == 0) {
+                            // Download path - enter edit mode
                             st.settings_editing = true;
                             strncpy(st.settings_edit_buffer, st.config.download_path,
                                     sizeof(st.settings_edit_buffer) - 1);
                             st.settings_edit_buffer[sizeof(st.settings_edit_buffer) - 1] = '\0';
                             st.settings_edit_pos = strlen(st.settings_edit_buffer);
                             snprintf(status, sizeof(status), "Editing download path...");
+                        } else if (st.settings_selected == 1) {
+                            // Seek step - prompt for new value
+                            char step_input[16] = {0};
+                            int len = get_string_input(step_input, sizeof(step_input), "Seek step (1-300 seconds): ");
+                            if (len > 0) {
+                                int new_step = atoi(step_input);
+                                if (new_step >= 1 && new_step <= 300) {
+                                    st.config.seek_step = new_step;
+                                    save_config(&st);
+                                    snprintf(status, sizeof(status), "Seek step set to %d seconds", new_step);
+                                } else {
+                                    snprintf(status, sizeof(status), "Invalid value (must be 1-300)");
+                                }
+                            }
+                        } else if (st.settings_selected == 2) {
+                            // Remember session - toggle
+                            st.config.remember_session = !st.config.remember_session;
+                            save_config(&st);
+                            snprintf(status, sizeof(status), "Remember session: %s",
+                                     st.config.remember_session ? "ON" : "OFF");
+                        } else if (st.settings_selected == 3) {
+                            // Shuffle mode - toggle
+                            st.shuffle_mode = !st.shuffle_mode;
+                            snprintf(status, sizeof(status), "Shuffle: %s",
+                                     st.shuffle_mode ? "ON" : "OFF");
                         }
                         break;
                 }
@@ -3671,7 +4098,34 @@ int main(int argc, char *argv[]) {
 
         draw_ui(&st, status);
     }
-    
+
+    // Save session state before exit
+    if (st.config.remember_session) {
+        st.was_playing_playlist = st.playing_from_playlist;
+        if (st.playing_from_playlist) {
+            st.last_playlist_idx = st.playing_playlist_idx;
+            st.last_song_idx = st.playing_index;
+        } else {
+            st.last_playlist_idx = -1;
+            st.last_song_idx = st.search_selected;
+            // Cache current search results
+            strncpy(st.last_query, st.query, sizeof(st.last_query) - 1);
+            st.cached_search_count = st.search_count;
+            for (int i = 0; i < st.search_count && i < MAX_RESULTS; i++) {
+                // Free any existing cached data
+                free(st.cached_search[i].title);
+                free(st.cached_search[i].video_id);
+                free(st.cached_search[i].url);
+                // Copy current search results
+                st.cached_search[i].title = st.search_results[i].title ? strdup(st.search_results[i].title) : NULL;
+                st.cached_search[i].video_id = st.search_results[i].video_id ? strdup(st.search_results[i].video_id) : NULL;
+                st.cached_search[i].url = st.search_results[i].url ? strdup(st.search_results[i].url) : NULL;
+                st.cached_search[i].duration = st.search_results[i].duration;
+            }
+        }
+        save_config(&st);
+    }
+
     // NEW: Stop download thread
     stop_download_thread(&st);
     stop_ytdlp_update(&st);
