@@ -2976,7 +2976,6 @@ int main(int argc, char *argv[]) {
         // Only check if we've been playing for at least 3 seconds
         if (st.playing_index >= 0 && mpv_ipc_fd >= 0) {
             if (now - st.playback_started >= 3) {
-                if (mpv_check_track_end()) {
                 mpv_check_events(&st);
                 if (st.eof) {
                     // Auto-play next track
