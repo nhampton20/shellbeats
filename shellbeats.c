@@ -118,13 +118,17 @@ typedef struct {
     int current_playlist_idx;
     int playlist_song_selected;
     int playlist_song_scroll;
-    
+
+    // EOF state
+    bool eof;
+
     // Playback state
     int playing_index;
     bool playing_from_playlist;
     int playing_playlist_idx;
     bool paused;
-    
+    float volume;
+
     // UI state
     ViewMode view;
     int add_to_playlist_selected;
@@ -1611,6 +1615,12 @@ static bool mpv_connect(void) {
         sb_log("[PLAYBACK] mpv_connect: failed to send observe command: %s", strerror(errno));
     }
     (void)w;
+    // Enable volume event observation
+    const char *volume_observe_cmd = "{\"command\": [\"observe_property\",2,\"volume\"]}\n";
+    ssize_t v = write(mpv_ipc_fd, volume_observe_cmd, strlen(volume_observe_cmd));
+    if (v < 0)
+        sb_log("[VOLUME] mpv_connect: failed to send observe command: %s", strerror(errno));
+    (void)v;
 
     return true;
 }
@@ -1651,6 +1661,17 @@ static void mpv_send_command(const char *cmd) {
     }
     w = write(mpv_ipc_fd, "\n", 1);
     (void)w;
+}
+
+static void mpv_volume_modify(int modifer) {
+    sb_log("[VOLUME] mpv_volume_modify called with modifier: %d", modifer);
+    char modifierString[4];
+    const char *commandPrefix = "{\"command\": [\"add\", \"volume\", \"";
+    sprintf(modifierString, "%d", modifer);
+    char *command = malloc(sizeof(char) * (strlen(commandPrefix)) + strlen(modifierString) + 1);
+    sprintf(command, "%s%d\"]}", commandPrefix, modifer);
+    mpv_send_command(command);
+    free(command);
 }
 
 static void mpv_toggle_pause(void) {
@@ -1773,37 +1794,49 @@ static void mpv_quit(void) {
 
 // Check if mpv finished playing (returns true if track ended)
 // Only returns true for genuine end-of-file, not loading states
-static bool mpv_check_track_end(void) {
-    if (mpv_ipc_fd < 0) return false;
+static void mpv_check_events(AppState *st) {
+    if (mpv_ipc_fd < 0)
+        return;
 
-    char buf[4096];
-    ssize_t n = read(mpv_ipc_fd, buf, sizeof(buf) - 1);
-
-    if (n <= 0) {
+    char buf[100];
+    int dup_fd = dup(mpv_ipc_fd);
+    FILE *stream = fdopen(dup_fd, "r");
+    if (stream == NULL) {
+        // if (n <= 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
             // Connection lost
-            sb_log("[PLAYBACK] mpv_check_track_end: connection lost: %s (errno=%d)", strerror(errno), errno);
+            sb_log("[PLAYBACK] mpv_check_events: connection lost: %s (errno=%d)", strerror(errno), errno);
             mpv_disconnect();
+            fclose(stream);
+            return;
         }
-        return false;
+        fclose(stream);
+        return;
     }
 
-    buf[n] = '\0';
-    sb_log("[PLAYBACK] mpv_check_track_end: IPC data received (%zd bytes): %.200s", n, buf);
+    // Loop over events
+    st->eof = false;
+    while (fgets(buf, sizeof(buf) - 1, stream) != NULL) {
+        // Check for track end updates
+        if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"eof\"")) {
+            sb_log("[PLAYBACK] mpv_check_events: track ended (EOF)");
+            st->eof = true;
+        }
 
-    // Only trigger on end-file event with reason "eof" (not "error" or "stop")
-    // Format: {"event":"end-file","reason":"eof",...}
-    if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"eof\"")) {
-        sb_log("[PLAYBACK] mpv_check_track_end: track ended (EOF)");
-        return true;
+        // Log if there's an end-file with error reason (useful for debugging stream failures)
+        if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"error\"")) {
+            sb_log("[PLAYBACK] mpv_check_events: WARNING - track ended with ERROR");
+        }
+        if (strstr(buf, "event\":\"property-change") && strstr(buf, "id\":2")) {
+            char log[50];
+            float volume = atof(strstr(buf, "data\":") + 6);
+            sprintf(log, "[VOLUME] mpv_check_events: volume is %f", volume);
+            sb_log(log);
+            st->volume = volume;
+        }
     }
-
-    // Log if there's an end-file with error reason (useful for debugging stream failures)
-    if (strstr(buf, "\"event\":\"end-file\"") && strstr(buf, "\"reason\":\"error\"")) {
-        sb_log("[PLAYBACK] mpv_check_track_end: WARNING - track ended with ERROR");
-    }
-
-    return false;
+    fclose(stream);
+    return;
 }
 
 // ============================================================================
@@ -2206,6 +2239,10 @@ static void draw_now_playing(AppState *st, int rows, int cols) {
         
         if (st->paused) {
             printw(" [PAUSED]");
+        }
+
+        if (st->volume >= 0) {
+            printw("\tVolume: %f", st->volume);
         }
     }
     
@@ -2773,6 +2810,8 @@ static void show_help(void) {
     mvprintw(y++, 6, "S           Settings");  // NEW
     mvprintw(y++, 6, "h or ?      Show this help");
     mvprintw(y++, 6, "q           Quit");
+    mvprintw(y++, 6, "-           Volume down");
+    mvprintw(y++, 6, "=           Volume up");
     y++;
     
     mvprintw(y++, 4, "PLAYLIST CONTROLS:");
@@ -2860,6 +2899,7 @@ int main(int argc, char *argv[]) {
     }
 
     AppState st = {0};
+    st.volume = 100;
     st.playing_index = -1;
     st.playing_playlist_idx = -1;
     st.current_playlist_idx = -1;
@@ -2937,6 +2977,8 @@ int main(int argc, char *argv[]) {
         if (st.playing_index >= 0 && mpv_ipc_fd >= 0) {
             if (now - st.playback_started >= 3) {
                 if (mpv_check_track_end()) {
+                mpv_check_events(&st);
+                if (st.eof) {
                     // Auto-play next track
                     play_next(&st);
                     if (st.playing_index >= 0) {
@@ -3134,6 +3176,12 @@ int main(int argc, char *argv[]) {
                 clear();
                 break;
             
+            case '-':
+                mpv_volume_modify(-5);
+                break;
+            case '=':
+                mpv_volume_modify(5);
+                break;
             default:
                 break;
         }
